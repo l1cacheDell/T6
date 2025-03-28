@@ -22,7 +22,7 @@ class ModelArgs:
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
-    head_dim: int = -1
+    head_dim: int = -1  # 4096 / 32 = 128, default
     q_rank: int = 12
     rank: int = 2
     using_groupnorm: bool = False
@@ -114,7 +114,7 @@ class TPA(nn.Module):
 
         if self.using_groupnorm:
             self.subln = T6GroupNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
-    def reset_parameters(self, args):
+    def reset_parameters(self):
         W_A_q_tensor = self.W_A_q.weight.view(self.dim, self.n_head, self.q_rank)
         W_A_k_tensor = self.W_A_k.weight.view(self.dim, self.n_head, self.rank)
         W_A_v_tensor = self.W_A_v.weight.view(self.dim, self.n_head, self.rank)
@@ -177,27 +177,45 @@ class TPA(nn.Module):
         B_v = self.cache_vB[:bsz, : start_pos + seqlen]
         
         # Reshape A_q, A_k, A_v
-        A_q = A_q.view(bsz * seqlen, self.n_head, self.q_rank)
-        A_k = A_k.view(bsz * seqlen, self.n_head, self.rank)
-        A_v = A_v.view(bsz * seqlen, self.n_head, self.rank)
+        A_q = A_q.reshape(bsz * seqlen, self.n_head, self.q_rank)
+        A_k = A_k.reshape(bsz * seqlen, self.n_head, self.rank)
+        A_v = A_v.reshape(bsz * seqlen, self.n_head, self.rank)
 
         # Reshape B_k, B_v  
-        B_q = B_q.view(bsz * seqlen, self.q_rank, self.head_dim)
-        B_k = B_k.view(bsz * seqlen, self.rank, self.head_dim)
-        B_v = B_v.view(bsz * seqlen, self.rank, self.head_dim)
+        B_q = B_q.reshape(bsz * seqlen, self.q_rank, self.head_dim)
+        B_k = B_k.reshape(bsz * seqlen, self.rank, self.head_dim)
+        B_v = B_v.reshape(bsz * seqlen, self.rank, self.head_dim)
         
-        q = torch.bmm(A_q, B_q).div_(self.q_rank).view(bsz, seqlen, self.n_head, self.head_dim)
-        k = torch.bmm(A_k, B_k).div_(self.rank).view(bsz, seqlen, self.n_head, self.head_dim)
-        v = torch.bmm(A_v, B_v).div_(self.rank).view(bsz, seqlen, self.n_head, self.head_dim)
+        q = torch.bmm(A_q, B_q).div_(self.q_rank).reshape(bsz, seqlen, self.n_head, self.head_dim)
+        k = torch.bmm(A_k, B_k).div_(self.rank).reshape(bsz, seqlen, self.n_head, self.head_dim)
+        v = torch.bmm(A_v, B_v).div_(self.rank).reshape(bsz, seqlen, self.n_head, self.head_dim)
         
-        k = k.transpose(1, 2) 
+        # sdpa
+        
+        # way one: sdpa
+        # transpose it to [bsz, num_head, seq_len, head_dim]
+        q_sdpa = q.transpose(1, 2)
+        k_sdpa = k.transpose(1, 2)
+        v_sdpa = v.transpose(1, 2)
+        with torch.nn.attention.sdpa_kernel(backends=[nn.attention.SDPBackend.MATH]):
+            o_sdpa = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, enable_gqa=True)
+
+        # way 2: manually compute
+        k = k.transpose(1, 2)
+        # q: [bsz, seq_len, num_head, head_dim]
+        # k: [bsz, num_head, seq_len, head_dim], has been transposed
+        # v: [bsz, seq_len, num_head, head_dim]
         scores = torch.matmul(q.transpose(1, 2), k.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
-        output = torch.matmul(scores, v.transpose(1, 2))  
+        output = torch.matmul(scores, v.transpose(1, 2))  # [bsz, num_head, seq_len, head_dim]
+        if torch.allclose(o_sdpa, output, rtol=1e-5, atol=1e-8):
+            print("same")
+        else:
+            print(torch.max(o_sdpa - output))
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+        return output
 
 
 class T6MLP(nn.Module):
@@ -296,3 +314,31 @@ class T6Model(nn.Module):
         h = F.rms_norm(h, (h.size(-1),))
         output = self.output(h).float()
         return output
+
+
+if __name__ == "__main__":
+    # 1. 定义模型参数
+    args = ModelArgs(
+        vocab_size=32000,
+        dim=4096,
+        n_heads=32,
+        n_kv_heads=2,
+        n_layers=32,
+        max_seq_len=2048
+    )
+
+    # 2. 初始化模型
+    model = T6Model(args).to('cuda')
+
+    # 3. 生成随机输入
+    batch_size = 2
+    seq_len = 16
+    random_tokens = torch.randint(0, args.vocab_size, (batch_size, seq_len)).to('cuda')
+
+    # 4. 前向计算
+    start_pos = 0
+    with torch.no_grad():  # 等价于@torch.inference_mode()
+        logits = model(random_tokens, start_pos)
+
+    print("Input shape:", random_tokens.shape)   # torch.Size([2, 10])
+    print("Output shape:", logits.shape)        # torch.Size([2, 10, 32000])
