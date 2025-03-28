@@ -211,7 +211,7 @@ class TPA(nn.Module):
         k_sdpa = k.transpose(1, 2)
         v_sdpa = v.transpose(1, 2)
         with torch.nn.attention.sdpa_kernel(backends=[nn.attention.SDPBackend.MATH]):
-            o_sdpa = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, enable_gqa=True, scale=math.sqrt(self.head_dim), is_causal=True)
+            o_sdpa = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, enable_gqa=True, scale=math.sqrt(self.head_dim), attn_mask=mask)
 
         # way 2: manually compute
         k = k.transpose(1, 2)
@@ -231,7 +231,7 @@ class TPA(nn.Module):
             print("same")
         else:
             sim, l1, max_diff = precision_cmp_torch(o_sdpa, output)
-            print(f"sim: {sim}, max_diff: {max_diff}")
+            print(f"sim: {sim:.5f}, max_diff: {max_diff:.5f}")
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return output
 
