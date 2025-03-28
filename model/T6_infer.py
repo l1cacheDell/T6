@@ -127,6 +127,7 @@ class TPA(nn.Module):
 
         if self.using_groupnorm:
             self.subln = T6GroupNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
+
     def reset_parameters(self):
         W_A_q_tensor = self.W_A_q.weight.view(self.dim, self.n_head, self.q_rank)
         W_A_k_tensor = self.W_A_k.weight.view(self.dim, self.n_head, self.rank)
@@ -156,6 +157,7 @@ class TPA(nn.Module):
         mask: Optional[torch.Tensor],
     ):
         bsz, seqlen, _ = x.shape
+        breakpoint()
 
         A_q = self.W_A_q(x).view(bsz, seqlen, self.n_head, self.q_rank)
         A_k = self.W_A_k(x).view(bsz, seqlen, self.n_head, self.rank)
@@ -202,11 +204,23 @@ class TPA(nn.Module):
         q = torch.bmm(A_q, B_q).div_(self.q_rank).reshape(bsz, seqlen, self.n_head, self.head_dim)
         k = torch.bmm(A_k, B_k).div_(self.rank).reshape(bsz, seqlen, self.n_head, self.head_dim)
         v = torch.bmm(A_v, B_v).div_(self.rank).reshape(bsz, seqlen, self.n_head, self.head_dim)
+
+        import numpy as np
+        np.save("q.npy", q.cpu().numpy())
+        np.save("k.npy", k.cpu().numpy())
+        np.save("v.npy", v.cpu().numpy())
         
         # sdpa
         
         # way one: sdpa
         # transpose it to [bsz, num_head, seq_len, head_dim]
+
+        # ================= TEST =================
+        # q = torch.randn(bsz, seqlen, self.n_heads, self.head_dim, dtype=x.dtype, device='cuda')
+        # k = torch.randn(bsz, seqlen, self.n_heads, self.head_dim, dtype=x.dtype, device='cuda')
+        # v = torch.randn(bsz, seqlen, self.n_heads, self.head_dim, dtype=x.dtype, device='cuda')
+        # results: sim: 0.76355, max_diff: 3.79772, which means the qkv is not a random generated tensor like SA
+        
         q_sdpa = q.transpose(1, 2)
         k_sdpa = k.transpose(1, 2)
         v_sdpa = v.transpose(1, 2)
@@ -351,11 +365,16 @@ if __name__ == "__main__":
     # 3. 生成随机输入
     batch_size = 2
     seq_len = 16
+    torch.manual_seed(42)
     random_tokens = torch.randint(0, args.vocab_size, (batch_size, seq_len)).to('cuda')
+    import numpy as np
+    input_npy = random_tokens.cpu().numpy()
+    np.save("input.npy", input_npy)
 
     # 4. 前向计算
     start_pos = 0
     with torch.no_grad():  # 等价于@torch.inference_mode()
+        breakpoint()
         logits = model(random_tokens, start_pos)
 
     print("Input shape:", random_tokens.shape)   # torch.Size([2, 10])
