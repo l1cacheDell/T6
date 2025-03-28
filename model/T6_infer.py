@@ -78,7 +78,20 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+def precision_cmp_torch(t1: torch.Tensor, t2: torch.Tensor):
+    x, xx = t1.to(dtype=torch.float32), t2.to(dtype=torch.float32)
+    # 重塑张量并计算余弦相似度
+    x_reshaped = torch.reshape(x, [1, -1])
+    xx_reshaped = torch.reshape(xx, [1, -1])
+    sim = torch.nn.functional.cosine_similarity(x_reshaped, xx_reshaped).item()
+    
+    # 计算 L1 误差
+    l1 = (torch.abs(x - xx).sum() / torch.abs(xx).sum()).item()
 
+    max_diff = torch.max(x - xx)
+    # print("Max Diff: ", max_diff.item())
+    
+    return sim, l1, max_diff
 
 class TPA(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -198,13 +211,17 @@ class TPA(nn.Module):
         k_sdpa = k.transpose(1, 2)
         v_sdpa = v.transpose(1, 2)
         with torch.nn.attention.sdpa_kernel(backends=[nn.attention.SDPBackend.MATH]):
-            o_sdpa = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, enable_gqa=True)
+            o_sdpa = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, enable_gqa=True, scale=math.sqrt(self.head_dim), is_causal=True)
 
         # way 2: manually compute
         k = k.transpose(1, 2)
         # q: [bsz, seq_len, num_head, head_dim]
         # k: [bsz, num_head, seq_len, head_dim], has been transposed
         # v: [bsz, seq_len, num_head, head_dim]
+
+        # this will transpose to:
+        # q: [bsz, num_head, seq_len, head_dim]
+        # k: [bsz, num_head, head_dim, seq_len]
         scores = torch.matmul(q.transpose(1, 2), k.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  
@@ -213,7 +230,8 @@ class TPA(nn.Module):
         if torch.allclose(o_sdpa, output, rtol=1e-5, atol=1e-8):
             print("same")
         else:
-            print(torch.max(o_sdpa - output))
+            sim, l1, max_diff = precision_cmp_torch(o_sdpa, output)
+            print(f"sim: {sim}, max_diff: {max_diff}")
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return output
 
@@ -322,7 +340,7 @@ if __name__ == "__main__":
         vocab_size=32000,
         dim=4096,
         n_heads=32,
-        n_kv_heads=2,
+        # n_kv_heads=2,
         n_layers=32,
         max_seq_len=2048
     )
